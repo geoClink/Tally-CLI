@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+import sys, json, os
+from datetime import datetime, date, timedelta
+DATA_FILE = "/Users/Shared/tally/data.json"
+CONFIG_FILE = "/Users/Shared/tally/config.json"
+DEFAULT_GOAL = 5.0
+WARN_THRESHOLD = 0.8
+def load_data():
+    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+    if not os.path.exists(DATA_FILE): return {"sessions": [], "active": None}
+    with open(DATA_FILE) as f: return json.load(f)
+def save_data(data):
+    with open(DATA_FILE, "w") as f: json.dump(data, f, indent=2)
+def load_config():
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    if not os.path.exists(CONFIG_FILE): return {"goal": DEFAULT_GOAL}
+    with open(CONFIG_FILE) as f: return json.load(f)
+def save_config(config):
+    with open(CONFIG_FILE, "w") as f: json.dump(config, f, indent=2)
+def now_str(): return datetime.now().isoformat()
+def hours_between(start, end):
+    return (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds() / 3600
+def week_bounds():
+    today = date.today(); monday = today - timedelta(days=today.weekday())
+    return monday, monday + timedelta(days=6)
+def sessions_this_week(sessions):
+    monday, sunday = week_bounds()
+    return [s for s in sessions if monday <= date.fromisoformat(s["date"]) <= sunday]
+def total_hours(sessions): return sum(s.get("hours", 0.0) for s in sessions)
+def hours_by_client(sessions):
+    d = {}
+    for s in sessions: d[s.get("client","unknown")] = d.get(s.get("client","unknown"),0.0) + s.get("hours",0.0)
+    return d
+def fmt_hours(h):
+    hrs=int(h); mins=int(round((h-hrs)*60))
+    if hrs==0: return f"{mins}m"
+    if mins==0: return f"{hrs}h"
+    return f"{hrs}h {mins}m"
+def check_warning(week_hours, goal):
+    if week_hours >= goal: print(f"  WARNING: {fmt_hours(week_hours)} of {goal:.0f}h used")
+    elif goal and week_hours/goal >= WARN_THRESHOLD: print(f"  Heads up: {fmt_hours(goal-week_hours)} remaining this week")
+def start(client):
+    data = load_data()
+    if data.get("active"): print(f"  Already tracking '{data['active']['client']}'"); return
+    client = client or "general"
+    data["active"] = {"client": client, "start": now_str(), "paused": False}
+    save_data(data); print(f"  Started '{client}' at {datetime.now().strftime('%I:%M %p')}")
+def pause():
+    data = load_data(); active = data.get("active")
+    if not active: print("  No active session."); return
+    if active.get("paused"): print("  Already paused."); return
+    active["accumulated"] = active.get("accumulated",0.0) + hours_between(active["start"], now_str())
+    active["paused"] = True; save_data(data)
+    print(f"  Paused '{active['client']}' — {fmt_hours(active['accumulated'])} accumulated")
+def resume(client):
+    data = load_data(); active = data.get("active")
+    if not active: start(client); return
+    if not active.get("paused"): print(f"  Already running."); return
+    active["start"] = now_str(); active["paused"] = False
+    save_data(data); print(f"  Resumed '{active['client']}'")
+def stop():
+    data = load_data(); active = data.get("active")
+    if not active: print("  No active session."); return
+    hours = active.get("accumulated",0.0) + (0 if active.get("paused") else hours_between(active["start"], now_str()))
+    session = {"client": active["client"], "start": active["start"], "end": now_str(), "hours": round(hours,4), "date": date.today().isoformat()}
+    data["sessions"].append(session); data["active"] = None; save_data(data)
+    config = load_config(); goal = config.get("goal", DEFAULT_GOAL)
+    week_hours = total_hours(sessions_this_week(data["sessions"]))
+    print(f"  Stopped '{session['client']}' — {fmt_hours(hours)}")
+    print(f"  This week: {fmt_hours(week_hours)} / {goal:.0f}h"); check_warning(week_hours, goal)
+def status():
+    data = load_data(); config = load_config(); goal = config.get("goal", DEFAULT_GOAL)
+    active = data.get("active")
+    if active:
+        h = active.get("accumulated",0.0) + (0 if active.get("paused") else hours_between(active["start"], now_str()))
+        state = "paused" if active.get("paused") else "running"
+        print(f"  '{active['client']}' {state} — {fmt_hours(h)} so far")
+    else: print("  No active session")
+    today_h = total_hours([s for s in data["sessions"] if s.get("date")==date.today().isoformat()])
+    print(f"  Today: {fmt_hours(today_h)}")
+    week_sessions = sessions_this_week(data["sessions"]); week_hours = total_hours(week_sessions)
+    monday, sunday = week_bounds()
+    filled = min(int((week_hours/goal)*20),20) if goal else 0
+    bar = "█"*filled + "░"*(20-filled)
+    print(f"  Week ({monday.strftime('%b %d')} - {sunday.strftime('%b %d')}): {fmt_hours(week_hours)} / {goal:.0f}h")
+    print(f"  [{bar}] {int((week_hours/goal)*100) if goal else 0}%"); check_warning(week_hours, goal)
+    by_client = hours_by_client(week_sessions)
+    if by_client:
+        print("  Breakdown:")
+        for c,h in sorted(by_client.items(), key=lambda x:-x[1]): print(f"    {c}: {fmt_hours(h)}")
+def report():
+    data = load_data(); config = load_config(); goal = config.get("goal", DEFAULT_GOAL)
+    print("  All-time:"); all_clients = hours_by_client(data["sessions"])
+    if all_clients:
+        for c,h in sorted(all_clients.items(), key=lambda x:-x[1]): print(f"    {c}: {fmt_hours(h)}")
+        print(f"    Total: {fmt_hours(total_hours(data['sessions']))}")
+    else: print("    No sessions yet.")
+    week_sessions = sessions_this_week(data["sessions"]); week_hours = total_hours(week_sessions)
+    monday, sunday = week_bounds()
+    print(f"\n  This week ({monday.strftime('%b %d')} - {sunday.strftime('%b %d')}): {fmt_hours(week_hours)} / {goal:.0f}h")
+    check_warning(week_hours, goal)
+    for c,h in sorted(hours_by_client(week_sessions).items(), key=lambda x:-x[1]): print(f"    {c}: {fmt_hours(h)}")
+def add(client, hours_str, date_str):
+    if not client or not hours_str: print("  Usage: tally add <client> <hours> [YYYY-MM-DD]"); return
+    try: hours = float(hours_str)
+    except: print(f"  Invalid hours: '{hours_str}'"); return
+    try: entry_date = date.fromisoformat(date_str) if date_str else date.today()
+    except: print(f"  Invalid date: '{date_str}'"); return
+    data = load_data()
+    data["sessions"].append({"client": client, "start": entry_date.isoformat(), "end": entry_date.isoformat(), "hours": round(hours,4), "date": entry_date.isoformat(), "manual": True})
+    save_data(data); print(f"  Added {fmt_hours(hours)} for '{client}' on {entry_date.strftime('%b %d, %Y')}")
+def set_goal(hours_str):
+    if not hours_str: config = load_config(); print(f"  Goal: {config.get('goal',DEFAULT_GOAL):.0f}h/week"); return
+    try: hours = float(hours_str)
+    except: print(f"  Invalid: '{hours_str}'"); return
+    config = load_config(); config["goal"] = hours; save_config(config)
+    print(f"  Weekly goal set to {hours:.0f}h")
+def main():
+    args = sys.argv[1:]; command = args[0] if args else "status"
+    if command == "start": start(args[1] if len(args)>1 else "")
+    elif command == "resume": resume(args[1] if len(args)>1 else "")
+    elif command == "pause": pause()
+    elif command == "stop": stop()
+    elif command == "status": status()
+    elif command == "report": report()
+    elif command == "add": add(args[1] if len(args)>1 else "", args[2] if len(args)>2 else "", args[3] if len(args)>3 else "")
+    elif command == "goal": set_goal(args[1] if len(args)>1 else "")
+    else: print("Commands: start, stop, pause, resume, status, report, add, goal")
+if __name__ == "__main__": main()
