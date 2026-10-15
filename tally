@@ -344,7 +344,13 @@ def cmd_jira(args):
     sub = args[0] if args else "status"
     config = load_config()
     if sub == "connect":
-        site = normalize_site(input("  Jira site (e.g. yourteam.atlassian.net): "))
+        raw_site = input("  Jira site, from the address bar (e.g. yourteam.atlassian.net): ")
+        if "@" in raw_site:
+            raise TallyError("That looks like an email. Enter the Jira web address, like yourteam.atlassian.net")
+        site = normalize_site(raw_site)
+        if site in ("id.atlassian.com", "home.atlassian.com", "start.atlassian.com", "admin.atlassian.com"):
+            raise TallyError(f"{site} is your Atlassian account, not a Jira site. Open your Jira and copy the "
+                             "address, like yourteam.atlassian.net (home.atlassian.com lists your sites)")
         email = input("  Atlassian email: ").strip()
         token = getpass.getpass("  API token (input hidden): ").strip()
         status, info = http("GET", f"https://{site}/_edge/tenant_info")
