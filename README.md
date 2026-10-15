@@ -4,14 +4,25 @@ A terminal time tracker for freelancers. Track billable hours by client, set wee
 sessions to your [Tally](https://tallytimetracker.com) account, and log time to Jira tickets
 automatically.
 
-## Install
+## Install (Mac)
 
 Needs Python 3.9+ (already on macOS). No other dependencies.
 
 ```bash
-git clone https://github.com/geoClink/Tally-CLI.git ~/Documents/GithubProjects/Tally-CLI
-ln -sf ~/Documents/GithubProjects/Tally-CLI/tally /opt/homebrew/bin/tally   # or /usr/local/bin on Intel Macs
+git clone https://github.com/geoClink/Tally-CLI.git ~/Tally-CLI && ln -sf ~/Tally-CLI/tally /opt/homebrew/bin/tally
 ```
+
+No Homebrew, or an Intel Mac? Use `sudo ln -sf ~/Tally-CLI/tally /usr/local/bin/tally` for the second part.
+Update later with `git -C ~/Tally-CLI pull`.
+
+### New teammate checklist
+
+1. Install (above).
+2. `tally login` with your Tally email and password. Signed up with Apple or Google? Set a password first
+   with "Forgot password?" on tallytimetracker.com.
+3. Make **your own** Jira API token (see Jira below). Never share tokens: worklogs show under the token's owner.
+4. `tally jira connect`, then `tally jira link <KEY> "<Client>"` with the same client name your team uses.
+5. `tally tasks` to start; `tally stop` when done.
 
 ## Usage
 
@@ -64,6 +75,20 @@ By default only the ticket key goes to Tally, not its title. Turn titles on with
 - **Signed in to Tally with Google or Apple?** `tally login` needs a password for now. Set one with
   "Forgot password?" on tallytimetracker.com. Jira logging works without signing in.
 - **Something didn't sync:** `tally status` shows how many sessions are waiting; `tally sync` retries.
+
+## Accuracy
+
+tally only knows what you tell it, so it double-checks against your actual work in git:
+
+- **Idle check on stop.** If there were no file saves or commits for 20+ minutes while the timer ran
+  (lunch, a meeting, forgot to stop), `tally stop` shows the gap and offers to remove it. The first
+  stretch after starting gets twice the allowance, since reading the ticket and code comes first.
+  `tally idle 30` changes the limit; `tally idle off` turns it off.
+- **`tally review`** compares today's commits (in repos you've started timers in) with what you tracked
+  and offers to add the work no session covers, ticket included. `tally review 2026-10-14` checks
+  another day. Nothing is added without a yes.
+- **Proof of work.** Each Jira worklog lists the commits made during that session.
+  `tally jira proof off` leaves them out.
 
 ## Data
 

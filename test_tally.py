@@ -7,6 +7,8 @@ import importlib.util
 import io
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -226,6 +228,78 @@ class TallyTest(unittest.TestCase):
     def test_data_files_are_private(self):
         self.start_ago(1)
         self.assertEqual(os.stat(tally.data_path()).st_mode & 0o777, 0o600)
+
+
+class AccuracyTest(unittest.TestCase):
+    """Idle detection, commit review and proof of work."""
+
+    def t(self, hh, mm):
+        return datetime(2026, 10, 15, hh, mm).astimezone()
+
+    def test_no_gap_when_activity_is_steady(self):
+        events = [self.t(9, m) for m in range(5, 60, 10)]
+        self.assertEqual(tally.idle_gaps([(self.t(9, 0), self.t(10, 0))], events, timedelta(minutes=20)), [])
+
+    def test_lunch_in_the_middle_is_found_with_grace_on_both_sides(self):
+        events = [self.t(9, 30), self.t(12, 0), self.t(13, 0), self.t(13, 15)]
+        gaps = tally.idle_gaps([(self.t(9, 0), self.t(13, 30))], events, timedelta(minutes=20))
+        self.assertEqual(gaps, [(self.t(9, 35), self.t(11, 55)), (self.t(12, 5), self.t(12, 55))])
+
+    def test_reading_before_the_first_save_is_not_idle(self):
+        events = [self.t(9, 35), self.t(9, 50)]
+        self.assertEqual(tally.idle_gaps([(self.t(9, 0), self.t(10, 0))], events, timedelta(minutes=20)), [])
+
+    def test_forgot_to_stop_trims_the_tail(self):
+        gaps = tally.idle_gaps([(self.t(9, 0), self.t(17, 0))], [self.t(9, 50)], timedelta(minutes=20))
+        self.assertEqual(gaps[-1], (self.t(9, 55), self.t(17, 0)))
+
+    def test_paused_time_is_never_counted_as_idle(self):
+        segments = [(self.t(9, 0), self.t(9, 30)), (self.t(13, 0), self.t(13, 30))]
+        events = [self.t(9, 25), self.t(13, 20)]
+        self.assertEqual(tally.idle_gaps(segments, events, timedelta(minutes=20)), [])
+
+    def test_commits_group_into_blocks(self):
+        blocks = tally.work_blocks([self.t(14, 0), self.t(14, 40), self.t(15, 50), self.t(19, 0)])
+        self.assertEqual(blocks, [(self.t(13, 30), self.t(15, 50)), (self.t(18, 30), self.t(19, 0))])
+
+    def test_uncovered_skips_tracked_time_and_short_leftovers(self):
+        parts = tally.uncovered((self.t(13, 30), self.t(16, 0)), [(self.t(14, 0), self.t(15, 50))])
+        self.assertEqual(parts, [(self.t(13, 30), self.t(14, 0))])  # the 10 minutes after 15:50 is too short
+
+    def test_worklog_comment_lists_commits(self):
+        doc = tally.worklog_comment({"note": "pairing", "proof": ["abc1234 Fix login"]})
+        self.assertEqual(doc["content"][0]["content"][0]["text"], "pairing")
+        self.assertEqual(doc["content"][2]["type"], "bulletList")
+        self.assertIsNone(tally.worklog_comment({"proof": ["abc"]}, include_proof=False))
+
+
+class GitActivityTest(unittest.TestCase):
+    """Reads a real throwaway git repo."""
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.repo)
+        for args in (["init", "-q", "-b", "SCRUM-97-nav-graph"], ["config", "user.email", "me@example.com"],
+                     ["config", "user.name", "Me"], ["config", "commit.gpgsign", "false"]):
+            subprocess.run(["git", "-C", self.repo, *args], check=True)
+        self.base = (datetime.now().astimezone() - timedelta(hours=3)).replace(microsecond=0)
+        for i, minutes in enumerate((0, 20, 45)):
+            when = (self.base + timedelta(minutes=minutes)).isoformat()
+            with open(os.path.join(self.repo, f"f{i}.txt"), "w") as fh:
+                fh.write(str(i))
+            subprocess.run(["git", "-C", self.repo, "add", "."], check=True)
+            env = dict(os.environ, GIT_AUTHOR_DATE=when, GIT_COMMITTER_DATE=when)
+            subprocess.run(["git", "-C", self.repo, "commit", "-q", "-m", f"Step {i}"], check=True, env=env)
+
+    def test_my_commits_finds_times_and_branch_ticket(self):
+        commits = tally.my_commits(self.repo, self.base - timedelta(minutes=1), self.base + timedelta(hours=1))
+        self.assertEqual([c[2] for c in commits], ["Step 0", "Step 1", "Step 2"])
+        self.assertEqual({c[3] for c in commits}, {"SCRUM-97"})
+        self.assertEqual(commits[1][0], self.base + timedelta(minutes=20))
+
+    def test_other_authors_are_ignored(self):
+        subprocess.run(["git", "-C", self.repo, "config", "user.email", "someone@else.com"], check=True)
+        self.assertEqual(tally.my_commits(self.repo, self.base - timedelta(hours=1), datetime.now().astimezone()), [])
 
 
 if __name__ == "__main__":

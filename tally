@@ -336,12 +336,26 @@ def jira_started(iso):
     return parse_dt(iso).strftime("%Y-%m-%dT%H:%M:%S.000%z")
 
 
+def worklog_comment(session, include_proof=True):
+    """Atlassian document: the session note, then the commits made during it (proof of work)."""
+    content = []
+    if session.get("note"):
+        content.append({"type": "paragraph", "content": [{"type": "text", "text": session["note"]}]})
+    commits = session.get("proof", []) if include_proof else []
+    if commits:
+        content.append({"type": "paragraph", "content": [{"type": "text", "text": "Commits:"}]})
+        content.append({"type": "bulletList", "content": [
+            {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text", "text": c[:200]}]}]}
+            for c in commits[:25]]})
+    return {"type": "doc", "version": 1, "content": content} if content else None
+
+
 def post_worklog(config, session):
     base, headers = jira_auth(config)
     body = {"timeSpentSeconds": worklog_seconds(session["hours"]), "started": jira_started(session["start"])}
-    if session.get("note"):
-        body["comment"] = {"type": "doc", "version": 1,
-                           "content": [{"type": "paragraph", "content": [{"type": "text", "text": session["note"]}]}]}
+    comment = worklog_comment(session, config.get("jira", {}).get("proof", True))
+    if comment:
+        body["comment"] = comment
     status, payload = http("POST", f"{base}/issue/{urllib.parse.quote(session['jira_key'])}/worklog", headers, body)
     if status not in (200, 201):
         raise TallyError(f"Jira didn't accept the worklog: {error_text(payload)}")
@@ -398,6 +412,12 @@ def cmd_jira(args):
             save_config(config)
         state = "on: ticket titles are saved to Tally" if jira.get("store_titles") else "off: only ticket keys are saved to Tally"
         print(f"  Titles {state}")
+    elif sub == "proof":
+        jira = require_jira(config)
+        if len(args) > 1:
+            jira["proof"] = args[1].lower() in ("on", "yes", "true")
+            save_config(config)
+        print(f"  Commits in worklogs: {'on' if jira.get('proof', True) else 'off'}")
     elif sub == "disconnect":
         keychain_delete("jira-token")
         config.pop("jira", None)
@@ -412,6 +432,7 @@ def cmd_jira(args):
         for k, c in sorted(jira.get("links", {}).items()):
             print(f"    {k} → {c}")
         print(f"  Titles in Tally: {'on' if jira.get('store_titles') else 'off'}")
+        print(f"  Commits in worklogs: {'on' if jira.get('proof', True) else 'off'}")
     else:
         raise TallyError("Usage: tally jira connect | link KEY \"Client\" | unlink KEY | titles on|off | status | disconnect")
 
@@ -445,6 +466,120 @@ def branch_ticket():
     return m.group(1) if m else None
 
 
+# ---------- activity (git + file saves) ----------
+
+DEFAULT_IDLE_MINUTES = 20
+GRACE = timedelta(minutes=5)       # you keep working a few minutes after a save, and think before the next one
+SKIP_DIRS = {".git", "node_modules", "build", "dist", ".build", "DerivedData", "Pods", ".next", ".venv", "venv",
+             "__pycache__", ".gradle", "vendor", "target", ".turbo", ".cache"}
+
+
+def git(repo, *args):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def repo_root(path="."):
+    r = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def my_commits(repo, since, until):
+    """Your commits in [since, until] on any branch: [(time, short sha, subject, ticket)]."""
+    email = git(repo, "config", "user.email")
+    if not email:
+        return []
+    out = git(repo, "log", "--all", f"--author={email}", f"--since={since.isoformat()}",
+              f"--until={until.isoformat()}", "--format=%cI%x1f%h%x1f%s%x1f%D")
+    commits = []
+    for line in filter(None, out.splitlines()):
+        when, sha, subject, refs = (line.split("\x1f") + ["", "", ""])[:4]
+        m = TICKET_RE.search(subject.upper()) or TICKET_RE.search(refs.upper())
+        if not m:
+            m = TICKET_RE.search(git(repo, "name-rev", "--name-only", sha).upper())
+        commits.append((parse_dt(when), sha, subject, m.group(1) if m else None))
+    return sorted(commits)
+
+
+def file_saves(repo, since, until, limit=50000):
+    """Times you saved files in the repo (skipping build output and dependencies)."""
+    lo, hi, times, seen = since.timestamp(), until.timestamp(), [], 0
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in files:
+            seen += 1
+            if seen > limit:
+                return sorted(times)
+            try:
+                m = os.stat(os.path.join(root, name)).st_mtime
+            except OSError:
+                continue
+            if lo <= m <= hi:
+                times.append(datetime.fromtimestamp(m).astimezone())
+    return sorted(times)
+
+
+def idle_gaps(segments, events, threshold):
+    """Stretches inside the timed segments with no activity for longer than `threshold`.
+
+    Starting the timer counts as activity, but the stretch right after it gets twice the
+    allowance: people read the ticket and the code before they save anything. Each gap keeps
+    GRACE after the last activity and GRACE before the next one, so only time clearly away
+    is suggested for removal."""
+    gaps = []
+    for seg_start, seg_end in segments:
+        points = [seg_start] + [e for e in events if seg_start < e <= seg_end]
+        for i, (a, b) in enumerate(zip(points, points[1:] + [None])):
+            tail = b is None
+            b = seg_end if tail else b
+            allowed = threshold * 2 if i == 0 and not tail else threshold
+            if b - a > allowed:
+                cut_start = a + GRACE
+                cut_end = b if tail else b - GRACE
+                if cut_end > cut_start:
+                    gaps.append((cut_start, cut_end))
+    return gaps
+
+
+def work_blocks(times, join=timedelta(minutes=90), lead=timedelta(minutes=30)):
+    """Group commit times into likely work blocks. Each block starts `lead` before its first commit."""
+    blocks = []
+    for t in sorted(times):
+        if blocks and t - blocks[-1][1] <= join:
+            blocks[-1][1] = t
+        else:
+            blocks.append([t - lead, t])
+    return [tuple(b) for b in blocks]
+
+
+def uncovered(block, covered, minimum=timedelta(minutes=15)):
+    """Parts of `block` not inside any (start, end) in `covered`, each at least `minimum` long."""
+    parts = [block]
+    for c_start, c_end in covered:
+        nxt = []
+        for p_start, p_end in parts:
+            if c_end <= p_start or c_start >= p_end:
+                nxt.append((p_start, p_end))
+                continue
+            if c_start > p_start:
+                nxt.append((p_start, c_start))
+            if c_end < p_end:
+                nxt.append((c_end, p_end))
+        parts = nxt
+    return [p for p in parts if p[1] - p[0] >= minimum]
+
+
+def fmt_time(d):
+    return d.strftime("%I:%M %p").lstrip("0")
+
+
+def ask_yes(question, default=True):
+    if not sys.stdin.isatty():
+        return False
+    answer = input(f"  {question} [{'Y/n' if default else 'y/N'}] ").strip().lower()
+    return default if not answer else answer in ("y", "yes")
+
+
 # ---------- timer ----------
 
 def begin(client, issue=None, note=""):
@@ -452,7 +587,15 @@ def begin(client, issue=None, note=""):
     if data.get("active"):
         raise TallyError(f"Already tracking '{data['active']['client']}'. Run: tally stop")
     stamp = now().isoformat()
-    data["active"] = {"client": client, "start": stamp, "started_at": stamp, "paused": False, "note": note}
+    data["active"] = {"client": client, "start": stamp, "started_at": stamp, "paused": False, "note": note,
+                      "segments": []}
+    repo = repo_root()
+    if repo:
+        data["active"]["repo"] = repo
+        config = load_config()
+        if repo not in config.setdefault("repos", []):
+            config["repos"].append(repo)
+            save_config(config)
     if issue:
         data["active"].update(jira_key=issue["key"], jira_summary=issue["summary"])
     save_data(data)
@@ -505,6 +648,7 @@ def cmd_pause(_args):
     if active.get("paused"):
         raise TallyError("Already paused.")
     active["accumulated"] = active_hours(active)
+    active.setdefault("segments", []).append([active["start"], now().isoformat()])
     active["paused"] = True
     save_data(data)
     print(f"  Paused '{active['client']}' at {fmt_hours(active['accumulated'])}")
@@ -540,16 +684,40 @@ def cmd_stop(_args):
         raise TallyError("No active session.")
     hours = active_hours(active)
     started = active.get("started_at") or active["start"]
+    end = now()
+    segments = [(parse_dt(a), parse_dt(b)) for a, b in active.get("segments", [])]
+    if not active.get("paused"):
+        segments.append((parse_dt(active["start"]), end))
+    repo = active.get("repo")
+    proof = []
+    if repo and os.path.isdir(repo) and segments:
+        window = (segments[0][0], end)
+        commits = my_commits(repo, *window)
+        proof = [f"{sha} {subject}" for _, sha, subject, _ in commits]
+        idle = load_config().get("idle_minutes", DEFAULT_IDLE_MINUTES)
+        if idle:
+            events = sorted([c[0] for c in commits] + file_saves(repo, *window))
+            gaps = idle_gaps(segments, events, timedelta(minutes=idle))
+            away = sum((b - a for a, b in gaps), timedelta())
+            if away >= timedelta(minutes=1):
+                spans = ", ".join(f"{fmt_time(a)}–{fmt_time(b)}" for a, b in gaps)
+                print(f"  No file saves or commits for {fmt_hours(away.total_seconds() / 3600)} ({spans}).")
+                if ask_yes(f"Remove it? {fmt_hours(hours)} → {fmt_hours(hours - away.total_seconds() / 3600)}"):
+                    hours -= away.total_seconds() / 3600
+                    if gaps[-1][1] >= end - timedelta(seconds=1):
+                        end = gaps[-1][0]  # it ended when you stopped working, not when you typed stop
     session = {
         "client": active["client"],
         "start": started,
-        "end": now().isoformat(),
+        "end": end.isoformat(),
         "hours": round(hours, 4),
         # The day it started, so a session that runs past midnight stays on the right day.
         "date": parse_dt(started).date().isoformat(),
         "note": active.get("note", ""),
         "sync": {"tally": "pending"},
     }
+    if proof:
+        session["proof"] = proof
     if active.get("jira_key"):
         session.update(jira_key=active["jira_key"], jira_summary=active.get("jira_summary"))
         session["sync"]["jira"] = "pending" if hours * 3600 >= 30 else "skipped"
@@ -594,6 +762,80 @@ def sync(data, quiet=False):
             except TallyError as e:
                 print(f"  ✗ Jira: {e}. Retry with: tally sync")
         save_data(data)
+
+
+def cmd_review(args):
+    """Find work your commits show but no session covers, and offer to add it."""
+    try:
+        day = date.fromisoformat(args[0]) if args else date.today()
+    except ValueError:
+        raise TallyError("Usage: tally review [YYYY-MM-DD]")
+    config = load_config()
+    repos = [r for r in dict.fromkeys(config.get("repos", []) + [repo_root() or ""]) if r and os.path.isdir(r)]
+    if not repos:
+        raise TallyError("No repos yet. Start a timer inside a git repo once and tally remembers it.")
+    since = datetime(day.year, day.month, day.day).astimezone()
+    until = since + timedelta(days=1)
+    data = load_data()
+    covered = [(parse_dt(s["start"]), parse_dt(s["end"])) for s in data["sessions"]
+               if not s.get("manual") and parse_dt(s["start"]) < until and parse_dt(s["end"]) > since]
+    if data.get("active"):
+        covered.append((parse_dt(data["active"].get("started_at") or data["active"]["start"]), now()))
+    found = 0
+    for repo in repos:
+        commits = my_commits(repo, since, until)
+        for block in work_blocks([c[0] for c in commits]):
+            for start, end in uncovered(block, covered):
+                inside = [c for c in commits if start - timedelta(minutes=30) <= c[0] <= end]
+                tickets = [c[3] for c in inside if c[3]]
+                ticket = max(set(tickets), key=tickets.count) if tickets else None
+                found += 1
+                minutes = round((end - start).total_seconds() / 60)
+                what = ticket or os.path.basename(repo)
+                print(f"\n  {fmt_time(start)}–{fmt_time(end)}: {len(inside)} commit(s) in {os.path.basename(repo)}"
+                      f"{' on ' + ticket if ticket else ''}, nothing tracked")
+                for _, sha, subject, _ in inside[:5]:
+                    print(f"    {sha} {subject[:70]}")
+                if not sys.stdin.isatty():
+                    continue
+                answer = input(f"  Add {fmt_hours(minutes / 60)} for {what}? [y/N/minutes] ").strip().lower()
+                if answer.isdigit():
+                    minutes = int(answer)
+                elif answer not in ("y", "yes"):
+                    continue
+                if ticket and config.get("jira"):
+                    client = client_for(config, ticket.split("-")[0])
+                else:
+                    client = input("  Client: ").strip() or "general"
+                session = {"client": client, "start": start.isoformat(),
+                           "end": (start + timedelta(minutes=minutes)).isoformat(), "hours": round(minutes / 60, 4),
+                           "date": start.date().isoformat(), "note": "Added from commits by tally review",
+                           "proof": [f"{sha} {subject}" for _, sha, subject, _ in inside], "sync": {"tally": "pending"}}
+                if ticket and config.get("jira"):
+                    session.update(jira_key=ticket)
+                    session["sync"]["jira"] = "pending"
+                data["sessions"].append(session)
+                covered.append((start, end))
+                save_data(data)
+    if not found:
+        print(f"  Nothing missing on {day.strftime('%b %d')}: every commit falls inside a tracked session.")
+    else:
+        sync(data, quiet=True)
+
+
+def cmd_idle(args):
+    config = load_config()
+    if args:
+        value = args[0].lower()
+        if value in ("off", "0"):
+            config["idle_minutes"] = 0
+        elif value.isdigit():
+            config["idle_minutes"] = int(value)
+        else:
+            raise TallyError("Usage: tally idle <minutes> | off")
+        save_config(config)
+    minutes = config.get("idle_minutes", DEFAULT_IDLE_MINUTES)
+    print(f"  Idle check: {f'{minutes} minutes without file saves or commits' if minutes else 'off'}")
 
 
 def cmd_sync(_args):
@@ -697,13 +939,15 @@ USAGE = """Usage: tally <command>
   status | report               this week, by client
   add <client> <hours> [date]   log time by hand
   goal <hours>                  weekly goal
+  review [date]                 find work your commits show but no session covers
+  idle <minutes> | off          offer to remove time with no saves or commits (default 20)
   sync                          retry anything that didn't reach Tally or Jira
   login | logout                your Tally account
-  jira connect | link KEY "Client" | titles on|off | status | disconnect"""
+  jira connect | link KEY "Client" | titles on|off | proof on|off | status | disconnect"""
 
 COMMANDS = {"start": cmd_start, "tasks": cmd_tasks, "pause": cmd_pause, "resume": cmd_resume, "stop": cmd_stop,
             "note": cmd_note, "status": cmd_status, "report": cmd_report, "add": cmd_add, "goal": cmd_goal,
-            "sync": cmd_sync, "login": cmd_login, "logout": cmd_logout, "jira": cmd_jira}
+            "sync": cmd_sync, "review": cmd_review, "idle": cmd_idle, "login": cmd_login, "logout": cmd_logout, "jira": cmd_jira}
 
 
 def main(argv):
