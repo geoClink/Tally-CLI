@@ -56,6 +56,15 @@ Inside a git repo, a plain `tally start` uses the ticket in the branch name
 By default only the ticket key goes to Tally, not its title. Turn titles on with
 `tally jira titles on` if your client is fine with that.
 
+## Troubleshooting
+
+- **Which Jira site?** Open any ticket in your browser: in `https://acme.atlassian.net/browse/ABC-12`
+  the site is `acme.atlassian.net` and the project key is `ABC`. home.atlassian.com lists all your sites.
+- **`tally tasks` started nothing:** at "Start which?" type the ticket's number; Enter alone cancels.
+- **Signed in to Tally with Google or Apple?** `tally login` needs a password for now. Set one with
+  "Forgot password?" on tallytimetracker.com. Jira logging works without signing in.
+- **Something didn't sync:** `tally status` shows how many sessions are waiting; `tally sync` retries.
+
 ## Data
 
 - Sessions and settings: `~/Library/Application Support/tally/` (readable only by your account)
