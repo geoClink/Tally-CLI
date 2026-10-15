@@ -78,7 +78,9 @@ By default only the ticket key goes to Tally, not its title. Turn titles on with
 
 ## Accuracy
 
-tally only knows what you tell it, so it double-checks against your actual work in git:
+tally only knows what you tell it, so it double-checks against your actual work in git. Start the
+timer from inside your project's folder (any git repo): that's the repo it watches. Started anywhere
+else, the idle check and commit list are skipped.
 
 - **Idle check on stop.** If there were no file saves or commits for 20+ minutes while the timer ran
   (lunch, a meeting, forgot to stop), `tally stop` shows the gap and offers to remove it. The first
