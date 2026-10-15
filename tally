@@ -1,129 +1,717 @@
 #!/usr/bin/env python3
-import sys, json, os
-from datetime import datetime, date, timedelta
-DATA_FILE = "/Users/Shared/tally/data.json"
-CONFIG_FILE = "/Users/Shared/tally/config.json"
+"""tally: terminal time tracker for freelancers.
+
+Tracks billable hours by client, syncs sessions to your Tally account, and logs
+time to Jira tickets when you stop the timer. Standard library only (Python 3.9+).
+"""
+import base64
+import getpass
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import date, datetime, timedelta
+
+# Public project settings (the same values the Tally website ships). Override for a local stack.
+SUPABASE_URL = os.environ.get("TALLY_SUPABASE_URL", "https://fcmfuxoblbtxigknwhpz.supabase.co")
+SUPABASE_ANON_KEY = os.environ.get("TALLY_SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZjbWZ1eG9ibGJ0eGlna253aHB6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk5OTQ4MzQsImV4cCI6MjA5NTU3MDgzNH0.YFH0CVGnLAW4ufdj04aAc2e4CZeGxnNsyAfo3n40VPM")
+
+KEYCHAIN_SERVICE = "tally-cli"
+LEGACY_DIR = "/Users/Shared/tally"
 DEFAULT_GOAL = 5.0
 WARN_THRESHOLD = 0.8
+TICKET_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+
+
+class TallyError(Exception):
+    """A problem worth showing the user as one plain line."""
+
+
+# ---------- storage ----------
+
+def app_dir():
+    return os.environ.get("TALLY_HOME") or os.path.expanduser("~/Library/Application Support/tally")
+
+
+def data_path():
+    return os.path.join(app_dir(), "data.json")
+
+
+def config_path():
+    return os.path.join(app_dir(), "config.json")
+
+
+def migrate_legacy():
+    # Older versions kept data in /Users/Shared, which every account on the Mac can read.
+    if os.environ.get("TALLY_HOME") or os.path.exists(data_path()):
+        return
+    for name in ("data.json", "config.json"):
+        src = os.path.join(LEGACY_DIR, name)
+        if os.path.exists(src):
+            os.makedirs(app_dir(), exist_ok=True)
+            shutil.copy2(src, os.path.join(app_dir(), name))
+            print(f"  Moved {name} to {app_dir()} (the old copy in {LEGACY_DIR} is untouched)")
+
+
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path) as f:
+        return json.load(f)
+
+
+def save_json(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(value, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
 def load_data():
-    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-    if not os.path.exists(DATA_FILE): return {"sessions": [], "active": None}
-    with open(DATA_FILE) as f: return json.load(f)
+    return load_json(data_path(), {"sessions": [], "active": None})
+
+
 def save_data(data):
-    with open(DATA_FILE, "w") as f: json.dump(data, f, indent=2)
+    save_json(data_path(), data)
+
+
 def load_config():
-    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-    if not os.path.exists(CONFIG_FILE): return {"goal": DEFAULT_GOAL}
-    with open(CONFIG_FILE) as f: return json.load(f)
+    return load_json(config_path(), {"goal": DEFAULT_GOAL})
+
+
 def save_config(config):
-    with open(CONFIG_FILE, "w") as f: json.dump(config, f, indent=2)
-def now_str(): return datetime.now().isoformat()
+    save_json(config_path(), config)
+
+
+# ---------- keychain (macOS `security`) ----------
+
+def keychain_get(account):
+    r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def keychain_set(account, secret):
+    r = subprocess.run(["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", account, "-w", secret],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise TallyError(f"Couldn't save to Keychain: {r.stderr.strip()}")
+
+
+def keychain_delete(account):
+    subprocess.run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account],
+                   capture_output=True, text=True)
+
+
+# ---------- time ----------
+
+def now():
+    return datetime.now().astimezone()
+
+
+def parse_dt(s):
+    d = datetime.fromisoformat(s)
+    # Sessions saved by older versions have no offset; they were local time.
+    return d.astimezone() if d.tzinfo is None else d
+
+
 def hours_between(start, end):
-    return (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds() / 3600
+    return (parse_dt(end) - parse_dt(start)).total_seconds() / 3600
+
+
 def week_bounds():
-    today = date.today(); monday = today - timedelta(days=today.weekday())
+    today = date.today()
+    monday = today - timedelta(days=today.weekday())
     return monday, monday + timedelta(days=6)
+
+
 def sessions_this_week(sessions):
     monday, sunday = week_bounds()
     return [s for s in sessions if monday <= date.fromisoformat(s["date"]) <= sunday]
-def total_hours(sessions): return sum(s.get("hours", 0.0) for s in sessions)
+
+
+def total_hours(sessions):
+    return sum(s.get("hours", 0.0) for s in sessions)
+
+
 def hours_by_client(sessions):
-    d = {}
-    for s in sessions: d[s.get("client","unknown")] = d.get(s.get("client","unknown"),0.0) + s.get("hours",0.0)
-    return d
+    totals = {}
+    for s in sessions:
+        client = s.get("client", "unknown")
+        totals[client] = totals.get(client, 0.0) + s.get("hours", 0.0)
+    return totals
+
+
 def fmt_hours(h):
-    hrs=int(h); mins=int(round((h-hrs)*60))
-    if hrs==0: return f"{mins}m"
-    if mins==0: return f"{hrs}h"
+    hrs = int(h)
+    mins = int(round((h - hrs) * 60))
+    if mins == 60:
+        hrs, mins = hrs + 1, 0
+    if hrs == 0:
+        return f"{mins}m"
+    if mins == 0:
+        return f"{hrs}h"
     return f"{hrs}h {mins}m"
+
+
 def check_warning(week_hours, goal):
-    if week_hours >= goal: print(f"  WARNING: {fmt_hours(week_hours)} of {goal:.0f}h used")
-    elif goal and week_hours/goal >= WARN_THRESHOLD: print(f"  Heads up: {fmt_hours(goal-week_hours)} remaining this week")
-def start(client):
+    if week_hours >= goal:
+        print(f"  WARNING: {fmt_hours(week_hours)} of {goal:.0f}h used")
+    elif goal and week_hours / goal >= WARN_THRESHOLD:
+        print(f"  Heads up: {fmt_hours(goal - week_hours)} remaining this week")
+
+
+def active_hours(active):
+    running = 0 if active.get("paused") else hours_between(active["start"], now().isoformat())
+    return active.get("accumulated", 0.0) + running
+
+
+# ---------- HTTP ----------
+
+def http(method, url, headers=None, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers=dict(headers or {}))
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+            return resp.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw)
+        except ValueError:
+            return e.code, {"message": raw.decode(errors="replace")[:200]}
+    except urllib.error.URLError as e:
+        raise TallyError(f"Network error: {e.reason}")
+
+
+def error_text(payload):
+    if isinstance(payload, dict):
+        for k in ("error_description", "msg", "message", "error"):
+            if payload.get(k):
+                return str(payload[k])
+        if payload.get("errorMessages"):
+            return "; ".join(payload["errorMessages"])
+        if payload.get("errors"):
+            return "; ".join(f"{k}: {v}" for k, v in payload["errors"].items())
+    return str(payload)
+
+
+# ---------- Tally account (Supabase) ----------
+
+def supabase_headers(token=None):
+    return {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {token or SUPABASE_ANON_KEY}"}
+
+
+def save_auth(config, payload):
+    keychain_set("supabase-refresh", payload["refresh_token"])
+    config["tally"] = {"user_id": payload["user"]["id"], "email": payload["user"].get("email")}
+    save_config(config)
+
+
+def tally_access_token(config):
+    """A fresh access token, rotating the stored refresh token. None when not signed in."""
+    if not config.get("tally"):
+        return None
+    refresh = keychain_get("supabase-refresh")
+    if not refresh:
+        return None
+    status, payload = http("POST", f"{SUPABASE_URL}/auth/v1/token?grant_type=refresh_token",
+                           supabase_headers(), {"refresh_token": refresh})
+    if status != 200:
+        raise TallyError(f"Tally sign-in expired ({error_text(payload)}). Run: tally login")
+    save_auth(config, payload)
+    return payload["access_token"]
+
+
+def cmd_login(args):
+    config = load_config()
+    email = args[0] if args else input("  Tally email: ").strip()
+    password = getpass.getpass("  Tally password: ")
+    status, payload = http("POST", f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
+                           supabase_headers(), {"email": email, "password": password})
+    if status != 200:
+        raise TallyError(f"Sign-in failed: {error_text(payload)}")
+    save_auth(config, payload)
+    print(f"  Signed in as {payload['user'].get('email')}. New sessions sync to your Tally account.")
+
+
+def cmd_logout(_args):
+    config = load_config()
+    keychain_delete("supabase-refresh")
+    config.pop("tally", None)
+    save_config(config)
+    print("  Signed out of Tally. Sessions stay on this Mac until you sign in again.")
+
+
+def upload_session(config, token, session):
+    jira_key = session.get("jira_key")
+    note = session.get("note") or ""
+    if jira_key:
+        title = session.get("jira_summary") if config.get("jira", {}).get("store_titles") else None
+        note = " ".join(p for p in (jira_key, title and f"{title}", note and f"· {note}") if p)
+    body = {
+        "user_id": config["tally"]["user_id"],
+        "client": session["client"],
+        "start_time": session["start"],
+        "end_time": session["end"],
+        "hours": session["hours"],
+        "date": session["date"],
+        "task_note": note or None,
+        "is_manual": bool(session.get("manual")),
+        "is_billable": True,
+        "platform": "cli",
+    }
+    headers = supabase_headers(token)
+    headers["Prefer"] = "return=representation"
+    status, payload = http("POST", f"{SUPABASE_URL}/rest/v1/sessions", headers, body)
+    if status not in (200, 201):
+        raise TallyError(f"Tally rejected the session: {error_text(payload)}")
+    return payload[0]["id"]
+
+
+# ---------- Jira ----------
+
+def normalize_site(site):
+    site = re.sub(r"^https?://", "", site.strip()).strip("/").split("/")[0]
+    return site if "." in site else f"{site}.atlassian.net"
+
+
+def jira_auth(config):
+    jira = config.get("jira")
+    if not jira:
+        return None
+    token = keychain_get("jira-token")
+    if not token:
+        raise TallyError("Jira token missing from Keychain. Run: tally jira connect")
+    creds = base64.b64encode(f"{jira['email']}:{token}".encode()).decode()
+    return f"https://api.atlassian.com/ex/jira/{jira['cloud_id']}/rest/api/3", {"Authorization": f"Basic {creds}"}
+
+
+def jira_get(config, path):
+    base, headers = jira_auth(config)
+    status, payload = http("GET", base + path, headers)
+    if status != 200:
+        raise TallyError(f"Jira error {status}: {error_text(payload)}")
+    return payload
+
+
+def jira_issue(config, key):
+    issue = jira_get(config, f"/issue/{urllib.parse.quote(key)}?fields=summary,project")
+    return {"key": issue["key"], "summary": issue["fields"]["summary"], "project": issue["fields"]["project"]["key"]}
+
+
+def jira_my_issues(config, limit=25):
+    jql = "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"
+    query = urllib.parse.urlencode({"jql": jql, "fields": "summary,status,project", "maxResults": limit})
+    issues = jira_get(config, f"/search/jql?{query}").get("issues", [])
+    return [{"key": i["key"], "summary": i["fields"]["summary"], "status": i["fields"]["status"]["name"],
+             "project": i["fields"]["project"]["key"]} for i in issues]
+
+
+def worklog_seconds(hours):
+    # Jira's minimum is one minute; round to whole minutes like a person would.
+    return max(60, int(round(hours * 60)) * 60)
+
+
+def jira_started(iso):
+    return parse_dt(iso).strftime("%Y-%m-%dT%H:%M:%S.000%z")
+
+
+def post_worklog(config, session):
+    base, headers = jira_auth(config)
+    body = {"timeSpentSeconds": worklog_seconds(session["hours"]), "started": jira_started(session["start"])}
+    if session.get("note"):
+        body["comment"] = {"type": "doc", "version": 1,
+                           "content": [{"type": "paragraph", "content": [{"type": "text", "text": session["note"]}]}]}
+    status, payload = http("POST", f"{base}/issue/{urllib.parse.quote(session['jira_key'])}/worklog", headers, body)
+    if status not in (200, 201):
+        raise TallyError(f"Jira didn't accept the worklog: {error_text(payload)}")
+    return payload["id"]
+
+
+def cmd_jira(args):
+    sub = args[0] if args else "status"
+    config = load_config()
+    if sub == "connect":
+        site = normalize_site(input("  Jira site (e.g. yourteam.atlassian.net): "))
+        email = input("  Atlassian email: ").strip()
+        token = getpass.getpass("  API token (input hidden): ").strip()
+        status, info = http("GET", f"https://{site}/_edge/tenant_info")
+        if status != 200 or not info.get("cloudId"):
+            raise TallyError(f"Couldn't find a Jira site at {site}")
+        creds = base64.b64encode(f"{email}:{token}".encode()).decode()
+        status, me = http("GET", f"https://api.atlassian.com/ex/jira/{info['cloudId']}/rest/api/3/myself",
+                          {"Authorization": f"Basic {creds}"})
+        if status != 200:
+            raise TallyError(f"Jira rejected the token ({status}: {error_text(me)}). "
+                             "It needs read:jira-work, write:jira-work and read:jira-user.")
+        keychain_set("jira-token", token)
+        previous = config.get("jira", {})
+        config["jira"] = {"site": site, "email": email, "cloud_id": info["cloudId"],
+                          "account_id": me.get("accountId"), "name": me.get("displayName"),
+                          "store_titles": previous.get("store_titles", False), "links": previous.get("links", {})}
+        save_config(config)
+        print(f"  Connected to {site} as {me.get('displayName')}.")
+        print("  Next: tally jira link <PROJECT KEY> \"<Client>\"   then   tally tasks")
+    elif sub == "link":
+        if len(args) < 3:
+            raise TallyError('Usage: tally jira link <PROJECT KEY> "<Client name>"')
+        jira = require_jira(config)
+        key = args[1].upper()
+        jira.setdefault("links", {})[key] = " ".join(args[2:])
+        save_config(config)
+        print(f"  {key} tickets now bill to '{jira['links'][key]}'")
+    elif sub == "unlink":
+        jira = require_jira(config)
+        removed = jira.get("links", {}).pop(args[1].upper(), None) if len(args) > 1 else None
+        save_config(config)
+        print(f"  Unlinked {args[1].upper()}" if removed else "  No such link")
+    elif sub == "titles":
+        jira = require_jira(config)
+        if len(args) > 1:
+            jira["store_titles"] = args[1].lower() in ("on", "yes", "true")
+            save_config(config)
+        state = "on: ticket titles are saved to Tally" if jira.get("store_titles") else "off: only ticket keys are saved to Tally"
+        print(f"  Titles {state}")
+    elif sub == "disconnect":
+        keychain_delete("jira-token")
+        config.pop("jira", None)
+        save_config(config)
+        print("  Disconnected from Jira and removed the token from Keychain.")
+    elif sub == "status":
+        jira = config.get("jira")
+        if not jira:
+            print("  Jira not connected. Run: tally jira connect")
+            return
+        print(f"  Jira: {jira['site']} as {jira.get('name')}")
+        for k, c in sorted(jira.get("links", {}).items()):
+            print(f"    {k} → {c}")
+        print(f"  Titles in Tally: {'on' if jira.get('store_titles') else 'off'}")
+    else:
+        raise TallyError("Usage: tally jira connect | link KEY \"Client\" | unlink KEY | titles on|off | status | disconnect")
+
+
+def require_jira(config):
+    if not config.get("jira"):
+        raise TallyError("Jira not connected. Run: tally jira connect")
+    return config["jira"]
+
+
+def client_for(config, project, ask=True):
+    links = config.get("jira", {}).get("links", {})
+    if project in links:
+        return links[project]
+    if not ask:
+        return None
+    client = input(f"  Which client is {project} for? ").strip()
+    if not client:
+        raise TallyError("No client given")
+    if input(f"  Always bill {project} to '{client}'? [Y/n] ").strip().lower() in ("", "y", "yes"):
+        config["jira"].setdefault("links", {})[project] = client
+        save_config(config)
+    return client
+
+
+def branch_ticket():
+    r = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    m = TICKET_RE.search(r.stdout.strip().upper())
+    return m.group(1) if m else None
+
+
+# ---------- timer ----------
+
+def begin(client, issue=None, note=""):
     data = load_data()
-    if data.get("active"): print(f"  Already tracking '{data['active']['client']}'"); return
-    client = client or "general"
-    data["active"] = {"client": client, "start": now_str(), "paused": False}
-    save_data(data); print(f"  Started '{client}' at {datetime.now().strftime('%I:%M %p')}")
-def pause():
-    data = load_data(); active = data.get("active")
-    if not active: print("  No active session."); return
-    if active.get("paused"): print("  Already paused."); return
-    active["accumulated"] = active.get("accumulated",0.0) + hours_between(active["start"], now_str())
-    active["paused"] = True; save_data(data)
-    print(f"  Paused '{active['client']}' — {fmt_hours(active['accumulated'])} accumulated")
-def resume(client):
-    data = load_data(); active = data.get("active")
-    if not active: start(client); return
-    if not active.get("paused"): print(f"  Already running."); return
-    active["start"] = now_str(); active["paused"] = False
-    save_data(data); print(f"  Resumed '{active['client']}'")
-def stop():
-    data = load_data(); active = data.get("active")
-    if not active: print("  No active session."); return
-    hours = active.get("accumulated",0.0) + (0 if active.get("paused") else hours_between(active["start"], now_str()))
-    session = {"client": active["client"], "start": active["start"], "end": now_str(), "hours": round(hours,4), "date": date.today().isoformat()}
-    data["sessions"].append(session); data["active"] = None; save_data(data)
-    config = load_config(); goal = config.get("goal", DEFAULT_GOAL)
+    if data.get("active"):
+        raise TallyError(f"Already tracking '{data['active']['client']}'. Run: tally stop")
+    stamp = now().isoformat()
+    data["active"] = {"client": client, "start": stamp, "started_at": stamp, "paused": False, "note": note}
+    if issue:
+        data["active"].update(jira_key=issue["key"], jira_summary=issue["summary"])
+    save_data(data)
+    label = f"{issue['key']} {issue['summary']} ({client})" if issue else f"'{client}'"
+    print(f"  Started {label} at {now().strftime('%I:%M %p').lstrip('0')}")
+
+
+def cmd_start(args):
+    config = load_config()
+    text = " ".join(args).strip()
+    key = text.upper() if TICKET_RE.fullmatch(text.upper() or "-") else None
+    if not text and config.get("jira"):
+        key = branch_ticket()
+        if key:
+            print(f"  Branch points at {key}")
+    if key:
+        require_jira(config)
+        issue = jira_issue(config, key)
+        begin(client_for(config, issue["project"]), issue)
+    else:
+        begin(text or "general")
+
+
+def cmd_tasks(_args):
+    config = load_config()
+    require_jira(config)
+    issues = jira_my_issues(config)
+    if not issues:
+        print("  No open tickets assigned to you.")
+        return
+    width = max(len(i["key"]) for i in issues)
+    for n, i in enumerate(issues, 1):
+        client = client_for(config, i["project"], ask=False)
+        tail = f"  → {client}" if client else ""
+        print(f"  {n:>2}. {i['key']:<{width}}  {i['status'][:14]:<14}  {i['summary'][:60]}{tail}")
+    pick = input("  Start which? (number, Enter to cancel) ").strip()
+    if not pick:
+        return
+    if not pick.isdigit() or not 1 <= int(pick) <= len(issues):
+        raise TallyError("Pick a number from the list")
+    issue = issues[int(pick) - 1]
+    begin(client_for(config, issue["project"]), issue)
+
+
+def cmd_pause(_args):
+    data = load_data()
+    active = data.get("active")
+    if not active:
+        raise TallyError("No active session.")
+    if active.get("paused"):
+        raise TallyError("Already paused.")
+    active["accumulated"] = active_hours(active)
+    active["paused"] = True
+    save_data(data)
+    print(f"  Paused '{active['client']}' at {fmt_hours(active['accumulated'])}")
+
+
+def cmd_resume(args):
+    data = load_data()
+    active = data.get("active")
+    if not active:
+        cmd_start(args)
+        return
+    if not active.get("paused"):
+        raise TallyError("Already running.")
+    active["start"] = now().isoformat()
+    active["paused"] = False
+    save_data(data)
+    print(f"  Resumed '{active['client']}'")
+
+
+def cmd_note(args):
+    data = load_data()
+    if not data.get("active"):
+        raise TallyError("No active session.")
+    data["active"]["note"] = " ".join(args)
+    save_data(data)
+    print("  Note saved")
+
+
+def cmd_stop(_args):
+    data = load_data()
+    active = data.get("active")
+    if not active:
+        raise TallyError("No active session.")
+    hours = active_hours(active)
+    started = active.get("started_at") or active["start"]
+    session = {
+        "client": active["client"],
+        "start": started,
+        "end": now().isoformat(),
+        "hours": round(hours, 4),
+        # The day it started, so a session that runs past midnight stays on the right day.
+        "date": parse_dt(started).date().isoformat(),
+        "note": active.get("note", ""),
+        "sync": {"tally": "pending"},
+    }
+    if active.get("jira_key"):
+        session.update(jira_key=active["jira_key"], jira_summary=active.get("jira_summary"))
+        session["sync"]["jira"] = "pending" if hours * 3600 >= 30 else "skipped"
+    data["sessions"].append(session)
+    data["active"] = None
+    save_data(data)
+    what = f"{session['jira_key']} ({session['client']})" if session.get("jira_key") else f"'{session['client']}'"
+    print(f"  Stopped {what}: {fmt_hours(hours)}")
+    sync(data)
+    goal = load_config().get("goal", DEFAULT_GOAL)
     week_hours = total_hours(sessions_this_week(data["sessions"]))
-    print(f"  Stopped '{session['client']}' — {fmt_hours(hours)}")
-    print(f"  This week: {fmt_hours(week_hours)} / {goal:.0f}h"); check_warning(week_hours, goal)
-def status():
-    data = load_data(); config = load_config(); goal = config.get("goal", DEFAULT_GOAL)
+    print(f"  This week: {fmt_hours(week_hours)} / {goal:.0f}h")
+    check_warning(week_hours, goal)
+
+
+def sync(data, quiet=False):
+    """Send pending sessions to Tally and pending worklogs to Jira. Safe to run repeatedly."""
+    config = load_config()
+    pending = [s for s in data["sessions"] if "pending" in s.get("sync", {}).values()]
+    if not pending:
+        if not quiet:
+            print("  Everything is synced.")
+        return
+    token = None
+    for s in pending:
+        label = s.get("jira_key") or s["client"]
+        if s["sync"].get("tally") == "pending":
+            if not config.get("tally"):
+                print("  Saved on this Mac only. Run `tally login` to sync it to your Tally account.")
+            else:
+                try:
+                    token = token or tally_access_token(config)
+                    s["sync"]["tally"] = upload_session(config, token, s)
+                    print(f"  ✓ Synced {label} to Tally")
+                except TallyError as e:
+                    print(f"  ✗ Tally: {e}. Retry with: tally sync")
+        if s["sync"].get("jira") == "pending":
+            try:
+                require_jira(config)
+                s["sync"]["jira"] = post_worklog(config, s)
+                print(f"  ✓ Logged {fmt_hours(worklog_seconds(s['hours']) / 3600)} on {s['jira_key']} in Jira")
+            except TallyError as e:
+                print(f"  ✗ Jira: {e}. Retry with: tally sync")
+        save_data(data)
+
+
+def cmd_sync(_args):
+    sync(load_data())
+
+
+def cmd_status(_args):
+    data = load_data()
+    config = load_config()
+    goal = config.get("goal", DEFAULT_GOAL)
     active = data.get("active")
     if active:
-        h = active.get("accumulated",0.0) + (0 if active.get("paused") else hours_between(active["start"], now_str()))
         state = "paused" if active.get("paused") else "running"
-        print(f"  '{active['client']}' {state} — {fmt_hours(h)} so far")
-    else: print("  No active session")
-    today_h = total_hours([s for s in data["sessions"] if s.get("date")==date.today().isoformat()])
-    print(f"  Today: {fmt_hours(today_h)}")
-    week_sessions = sessions_this_week(data["sessions"]); week_hours = total_hours(week_sessions)
+        what = f"{active['jira_key']} {active.get('jira_summary', '')} ({active['client']})" if active.get("jira_key") else f"'{active['client']}'"
+        print(f"  {what} {state}: {fmt_hours(active_hours(active))} so far")
+    else:
+        print("  No active session")
+    today = date.today().isoformat()
+    print(f"  Today: {fmt_hours(total_hours([s for s in data['sessions'] if s.get('date') == today]))}")
+    week = sessions_this_week(data["sessions"])
+    week_hours = total_hours(week)
     monday, sunday = week_bounds()
-    filled = min(int((week_hours/goal)*20),20) if goal else 0
-    bar = "█"*filled + "░"*(20-filled)
+    filled = min(int((week_hours / goal) * 20), 20) if goal else 0
     print(f"  Week ({monday.strftime('%b %d')} - {sunday.strftime('%b %d')}): {fmt_hours(week_hours)} / {goal:.0f}h")
-    print(f"  [{bar}] {int((week_hours/goal)*100) if goal else 0}%"); check_warning(week_hours, goal)
-    by_client = hours_by_client(week_sessions)
+    print(f"  [{'█' * filled}{'░' * (20 - filled)}] {int((week_hours / goal) * 100) if goal else 0}%")
+    check_warning(week_hours, goal)
+    by_client = hours_by_client(week)
     if by_client:
         print("  Breakdown:")
-        for c,h in sorted(by_client.items(), key=lambda x:-x[1]): print(f"    {c}: {fmt_hours(h)}")
-def report():
-    data = load_data(); config = load_config(); goal = config.get("goal", DEFAULT_GOAL)
-    print("  All-time:"); all_clients = hours_by_client(data["sessions"])
-    if all_clients:
-        for c,h in sorted(all_clients.items(), key=lambda x:-x[1]): print(f"    {c}: {fmt_hours(h)}")
-        print(f"    Total: {fmt_hours(total_hours(data['sessions']))}")
-    else: print("    No sessions yet.")
-    week_sessions = sessions_this_week(data["sessions"]); week_hours = total_hours(week_sessions)
-    monday, sunday = week_bounds()
-    print(f"\n  This week ({monday.strftime('%b %d')} - {sunday.strftime('%b %d')}): {fmt_hours(week_hours)} / {goal:.0f}h")
-    check_warning(week_hours, goal)
-    for c,h in sorted(hours_by_client(week_sessions).items(), key=lambda x:-x[1]): print(f"    {c}: {fmt_hours(h)}")
-def add(client, hours_str, date_str):
-    if not client or not hours_str: print("  Usage: tally add <client> <hours> [YYYY-MM-DD]"); return
-    try: hours = float(hours_str)
-    except: print(f"  Invalid hours: '{hours_str}'"); return
-    try: entry_date = date.fromisoformat(date_str) if date_str else date.today()
-    except: print(f"  Invalid date: '{date_str}'"); return
+        for c, h in sorted(by_client.items(), key=lambda x: -x[1]):
+            print(f"    {c}: {fmt_hours(h)}")
+    unsynced = sum(1 for s in data["sessions"] if "pending" in s.get("sync", {}).values())
+    if unsynced:
+        print(f"  {unsynced} session(s) waiting to sync. Run: tally sync")
+    accounts = []
+    accounts.append(f"Tally: {config['tally']['email']}" if config.get("tally") else "Tally: not signed in")
+    accounts.append(f"Jira: {config['jira']['site']}" if config.get("jira") else "Jira: not connected")
+    print("  " + " · ".join(accounts))
+
+
+def cmd_report(_args):
     data = load_data()
-    data["sessions"].append({"client": client, "start": entry_date.isoformat(), "end": entry_date.isoformat(), "hours": round(hours,4), "date": entry_date.isoformat(), "manual": True})
-    save_data(data); print(f"  Added {fmt_hours(hours)} for '{client}' on {entry_date.strftime('%b %d, %Y')}")
-def set_goal(hours_str):
-    if not hours_str: config = load_config(); print(f"  Goal: {config.get('goal',DEFAULT_GOAL):.0f}h/week"); return
-    try: hours = float(hours_str)
-    except: print(f"  Invalid: '{hours_str}'"); return
-    config = load_config(); config["goal"] = hours; save_config(config)
-    print(f"  Weekly goal set to {hours:.0f}h")
-def main():
-    args = sys.argv[1:]; command = args[0] if args else "status"
-    if command == "start": start(args[1] if len(args)>1 else "")
-    elif command == "resume": resume(args[1] if len(args)>1 else "")
-    elif command == "pause": pause()
-    elif command == "stop": stop()
-    elif command == "status": status()
-    elif command == "report": report()
-    elif command == "add": add(args[1] if len(args)>1 else "", args[2] if len(args)>2 else "", args[3] if len(args)>3 else "")
-    elif command == "goal": set_goal(args[1] if len(args)>1 else "")
-    else: print("Commands: start, stop, pause, resume, status, report, add, goal")
-if __name__ == "__main__": main()
+    goal = load_config().get("goal", DEFAULT_GOAL)
+    print("  All-time:")
+    all_clients = hours_by_client(data["sessions"])
+    if all_clients:
+        for c, h in sorted(all_clients.items(), key=lambda x: -x[1]):
+            print(f"    {c}: {fmt_hours(h)}")
+        print(f"    Total: {fmt_hours(total_hours(data['sessions']))}")
+    else:
+        print("    No sessions yet.")
+    week = sessions_this_week(data["sessions"])
+    monday, sunday = week_bounds()
+    print(f"\n  This week ({monday.strftime('%b %d')} - {sunday.strftime('%b %d')}): {fmt_hours(total_hours(week))} / {goal:.0f}h")
+    check_warning(total_hours(week), goal)
+    for c, h in sorted(hours_by_client(week).items(), key=lambda x: -x[1]):
+        print(f"    {c}: {fmt_hours(h)}")
+
+
+def cmd_add(args):
+    if len(args) < 2:
+        raise TallyError("Usage: tally add <client> <hours> [YYYY-MM-DD]")
+    client, hours_str = args[0], args[1]
+    try:
+        hours = float(hours_str)
+    except ValueError:
+        raise TallyError(f"Invalid hours: '{hours_str}'")
+    try:
+        day = date.fromisoformat(args[2]) if len(args) > 2 else date.today()
+    except ValueError:
+        raise TallyError(f"Invalid date: '{args[2]}'")
+    start = datetime(day.year, day.month, day.day).astimezone()
+    data = load_data()
+    data["sessions"].append({"client": client, "start": start.isoformat(),
+                             "end": (start + timedelta(hours=hours)).isoformat(), "hours": round(hours, 4),
+                             "date": day.isoformat(), "manual": True, "note": "", "sync": {"tally": "pending"}})
+    save_data(data)
+    print(f"  Added {fmt_hours(hours)} for '{client}' on {day.strftime('%b %d, %Y')}")
+    sync(data, quiet=True)
+
+
+def cmd_goal(args):
+    config = load_config()
+    if not args:
+        print(f"  Goal: {config.get('goal', DEFAULT_GOAL):.0f}h/week")
+        return
+    try:
+        config["goal"] = float(args[0])
+    except ValueError:
+        raise TallyError(f"Invalid: '{args[0]}'")
+    save_config(config)
+    print(f"  Weekly goal set to {config['goal']:.0f}h")
+
+
+USAGE = """Usage: tally <command>
+
+  start [client | TICKET-123]   start a timer (in a git repo, the branch's ticket is used)
+  tasks                         pick one of your open Jira tickets and start it
+  pause | resume | stop         stop saves to Tally and logs the time in Jira
+  note <text>                   add a note to the running session
+  status | report               this week, by client
+  add <client> <hours> [date]   log time by hand
+  goal <hours>                  weekly goal
+  sync                          retry anything that didn't reach Tally or Jira
+  login | logout                your Tally account
+  jira connect | link KEY "Client" | titles on|off | status | disconnect"""
+
+COMMANDS = {"start": cmd_start, "tasks": cmd_tasks, "pause": cmd_pause, "resume": cmd_resume, "stop": cmd_stop,
+            "note": cmd_note, "status": cmd_status, "report": cmd_report, "add": cmd_add, "goal": cmd_goal,
+            "sync": cmd_sync, "login": cmd_login, "logout": cmd_logout, "jira": cmd_jira}
+
+
+def main(argv):
+    migrate_legacy()
+    command = argv[0] if argv else "status"
+    if command in ("help", "-h", "--help"):
+        print(USAGE)
+        return 0
+    handler = COMMANDS.get(command)
+    if not handler:
+        print(USAGE)
+        return 1
+    try:
+        handler(argv[1:])
+        return 0
+    except TallyError as e:
+        print(f"  {e}")
+        return 1
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
