@@ -272,9 +272,17 @@ def upload_session(config, token, session):
         "is_billable": True,
         "platform": "cli",
     }
+    site = config.get("jira", {}).get("site")
+    if jira_key and site:
+        body.update(external_key=jira_key, external_url=f"https://{site}/browse/{jira_key}")
     headers = supabase_headers(token)
     headers["Prefer"] = "return=representation"
     status, payload = http("POST", f"{SUPABASE_URL}/rest/v1/sessions", headers, body)
+    if status == 400 and "external_" in error_text(payload):
+        # Database without the ticket-link columns yet: the key is still in the task note.
+        body.pop("external_key", None)
+        body.pop("external_url", None)
+        status, payload = http("POST", f"{SUPABASE_URL}/rest/v1/sessions", headers, body)
     if status not in (200, 201):
         raise TallyError(f"Tally rejected the session: {error_text(payload)}")
     return payload[0]["id"]

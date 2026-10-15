@@ -163,6 +163,32 @@ class TallyTest(unittest.TestCase):
         self.assertEqual(saved, {"tally": "session-1", "jira": "worklog-1"})
         self.assertEqual(self.keychain["supabase-refresh"], "refresh-2")  # rotated token was stored
 
+    def test_session_carries_ticket_link(self):
+        self.signed_in()
+        self.start_ago(10, jira_key="ACME-7", jira_summary="Fix login")
+        self.run_cli("stop")
+        session = self.server.posted("/rest/v1/sessions")[0]
+        self.assertEqual(session["external_key"], "ACME-7")
+        self.assertEqual(session["external_url"], "https://team.atlassian.net/browse/ACME-7")
+
+    def test_database_without_ticket_columns_still_syncs(self):
+        self.signed_in()
+        original = self.server.__call__
+
+        def no_columns(method, url, headers=None, body=None):
+            if url.endswith("/rest/v1/sessions") and body and "external_key" in body:
+                self.server.calls.append((method, url, headers or {}, body))
+                return 400, {"message": "Could not find the 'external_key' column of 'sessions' in the schema cache"}
+            return original(method, url, headers, body)
+
+        with mock.patch.object(tally, "http", no_columns):
+            self.start_ago(10, jira_key="ACME-7", jira_summary="Fix login")
+            self.run_cli("stop")
+        posts = self.server.posted("/rest/v1/sessions")
+        self.assertEqual(len(posts), 2)
+        self.assertNotIn("external_key", posts[1])
+        self.assertEqual(tally.load_data()["sessions"][0]["sync"]["tally"], "session-1")
+
     def test_titles_on_adds_ticket_title_to_task_note(self):
         self.signed_in(titles=True)
         self.start_ago(10, jira_key="ACME-7", jira_summary="Fix login")
