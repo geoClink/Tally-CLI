@@ -67,6 +67,13 @@ Inside a git repo, a plain `tally start` uses the ticket in the branch name
 By default only the ticket key goes to Tally, not its title. Turn titles on with
 `tally jira titles on` if your client is fine with that.
 
+Jira tokens expire. `tally jira connect` asks for the expiry date shown on the Atlassian page (or set it
+later with `tally jira expires 2026-12-30`), and `tally status`, `tally start` and `tally tasks` warn you
+in the last week.
+
+Weeks in `tally status` start on the day set in your Tally account (Settings → Week starts on),
+picked up on `tally login` and `tally sync`.
+
 ## Troubleshooting
 
 - **Which Jira site?** Open any ticket in your browser: in `https://acme.atlassian.net/browse/ABC-12`

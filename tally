@@ -19,6 +19,7 @@ from datetime import date, datetime, timedelta
 
 # Public project settings (the same values the Tally website ships). Override for a local stack.
 SUPABASE_URL = os.environ.get("TALLY_SUPABASE_URL", "https://fcmfuxoblbtxigknwhpz.supabase.co")
+JIRA_TOKEN_PAGE = "https://id.atlassian.com/manage-profile/security/api-tokens"
 SUPABASE_ANON_KEY = os.environ.get("TALLY_SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZjbWZ1eG9ibGJ0eGlna253aHB6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk5OTQ4MzQsImV4cCI6MjA5NTU3MDgzNH0.YFH0CVGnLAW4ufdj04aAc2e4CZeGxnNsyAfo3n40VPM")
 
 KEYCHAIN_SERVICE = "tally-cli"
@@ -126,10 +127,14 @@ def hours_between(start, end):
     return (parse_dt(end) - parse_dt(start)).total_seconds() / 3600
 
 
-def week_bounds():
-    today = date.today()
-    monday = today - timedelta(days=today.weekday())
-    return monday, monday + timedelta(days=6)
+def week_bounds(today=None, week_start=None):
+    """First and last day of the current week. week_start: 0 = Sunday … 6 = Saturday (your Tally account's
+    setting, saved on login and sync); Monday until then."""
+    today = today or date.today()
+    if week_start is None:
+        week_start = load_config().get("week_start", 1)
+    first = today - timedelta(days=(today.isoweekday() % 7 - week_start) % 7)
+    return first, first + timedelta(days=6)
 
 
 def sessions_this_week(sessions):
@@ -234,6 +239,16 @@ def tally_access_token(config):
     return payload["access_token"]
 
 
+def refresh_account_settings(config, token):
+    """Copy account settings the CLI uses (week start) from Tally, so weeks match the apps and website."""
+    status, rows = http("GET", f"{SUPABASE_URL}/rest/v1/config?select=week_start&user_id=eq.{config['tally']['user_id']}",
+                        supabase_headers(token))
+    if status == 200 and rows and isinstance(rows[0].get("week_start"), int) and 0 <= rows[0]["week_start"] <= 6:
+        if config.get("week_start") != rows[0]["week_start"]:
+            config["week_start"] = rows[0]["week_start"]
+            save_config(config)
+
+
 def cmd_login(args):
     config = load_config()
     email = args[0] if args else input("  Tally email: ").strip()
@@ -243,6 +258,7 @@ def cmd_login(args):
     if status != 200:
         raise TallyError(f"Sign-in failed: {error_text(payload)}")
     save_auth(config, payload)
+    refresh_account_settings(config, payload["access_token"])
     print(f"  Signed in as {payload['user'].get('email')}. New sessions sync to your Tally account.")
 
 
@@ -306,9 +322,47 @@ def jira_auth(config):
     return f"https://api.atlassian.com/ex/jira/{jira['cloud_id']}/rest/api/3", {"Authorization": f"Basic {creds}"}
 
 
+def parse_expiry(text, today=None):
+    """Token expiry date typed by the user: blank means unknown; must be today or later, within about a year."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        day = date.fromisoformat(text)
+    except ValueError:
+        raise TallyError("Enter the expiry date as YYYY-MM-DD, like 2026-12-30")
+    days = (day - (today or date.today())).days
+    if days < 0:
+        raise TallyError("That date has passed. Create a new token, then run: tally jira connect")
+    if days > 400:
+        raise TallyError("Atlassian tokens last at most a year. Check the date.")
+    return day.isoformat()
+
+
+def jira_token_warning(config, today=None):
+    """A reminder when the Jira token expires within a week (or already has); None otherwise."""
+    expires = config.get("jira", {}).get("token_expires_on")
+    if not expires:
+        return None
+    days = (date.fromisoformat(expires) - (today or date.today())).days
+    if days > 7:
+        return None
+    when = ("expired" if days < 0 else "expires today" if days == 0 else "expires tomorrow" if days == 1
+            else f"expires in {days} days")
+    return f"⚠ Your Jira token {when}. Make a new one ({JIRA_TOKEN_PAGE}), then run: tally jira connect"
+
+
+def warn_jira_token(config):
+    message = jira_token_warning(config)
+    if message:
+        print("  " + message)
+
+
 def jira_get(config, path):
     base, headers = jira_auth(config)
     status, payload = http("GET", base + path, headers)
+    if status in (401, 403):
+        raise TallyError("Jira rejected the token. It may have expired: make a new one and run: tally jira connect")
     if status != 200:
         raise TallyError(f"Jira error {status}: {error_text(payload)}")
     return payload
@@ -375,6 +429,7 @@ def cmd_jira(args):
                              "address, like yourteam.atlassian.net (home.atlassian.com lists your sites)")
         email = input("  Atlassian email: ").strip()
         token = getpass.getpass("  API token (input hidden): ").strip()
+        expires = parse_expiry(input("  Token expiry date, shown on the Atlassian page (YYYY-MM-DD, Enter to skip): "))
         status, info = http("GET", f"https://{site}/_edge/tenant_info")
         if status != 200 or not info.get("cloudId"):
             raise TallyError(f"Couldn't find a Jira site at {site}")
@@ -388,7 +443,8 @@ def cmd_jira(args):
         previous = config.get("jira", {})
         config["jira"] = {"site": site, "email": email, "cloud_id": info["cloudId"],
                           "account_id": me.get("accountId"), "name": me.get("displayName"),
-                          "store_titles": previous.get("store_titles", False), "links": previous.get("links", {})}
+                          "store_titles": previous.get("store_titles", False), "links": previous.get("links", {}),
+                          "token_expires_on": expires}
         save_config(config)
         print(f"  Connected to {site} as {me.get('displayName')}.")
         print("  Next: tally jira link <PROJECT KEY> \"<Client>\"   then   tally tasks")
@@ -412,6 +468,14 @@ def cmd_jira(args):
             save_config(config)
         state = "on: ticket titles are saved to Tally" if jira.get("store_titles") else "off: only ticket keys are saved to Tally"
         print(f"  Titles {state}")
+    elif sub == "expires":
+        jira = require_jira(config)
+        if len(args) > 1:
+            jira["token_expires_on"] = parse_expiry(args[1])
+            save_config(config)
+        expires = jira.get("token_expires_on")
+        print(f"  Token expires: {expires}" if expires else "  Token expiry not set. Run: tally jira expires YYYY-MM-DD")
+        warn_jira_token(config)
     elif sub == "proof":
         jira = require_jira(config)
         if len(args) > 1:
@@ -433,8 +497,11 @@ def cmd_jira(args):
             print(f"    {k} → {c}")
         print(f"  Titles in Tally: {'on' if jira.get('store_titles') else 'off'}")
         print(f"  Commits in worklogs: {'on' if jira.get('proof', True) else 'off'}")
+        print(f"  Token expires: {jira.get('token_expires_on') or 'not set (tally jira expires YYYY-MM-DD)'}")
+        warn_jira_token(config)
     else:
-        raise TallyError("Usage: tally jira connect | link KEY \"Client\" | unlink KEY | titles on|off | status | disconnect")
+        raise TallyError("Usage: tally jira connect | link KEY \"Client\" | unlink KEY | titles on|off | "
+                         "expires YYYY-MM-DD | status | disconnect")
 
 
 def require_jira(config):
@@ -613,6 +680,7 @@ def cmd_start(args):
             print(f"  Branch points at {key}")
     if key:
         require_jira(config)
+        warn_jira_token(config)
         issue = jira_issue(config, key)
         begin(client_for(config, issue["project"]), issue)
     else:
@@ -622,6 +690,7 @@ def cmd_start(args):
 def cmd_tasks(_args):
     config = load_config()
     require_jira(config)
+    warn_jira_token(config)
     issues = jira_my_issues(config)
     if not issues:
         print("  No open tickets assigned to you.")
@@ -839,6 +908,12 @@ def cmd_idle(args):
 
 
 def cmd_sync(_args):
+    config = load_config()
+    if config.get("tally"):
+        try:
+            refresh_account_settings(config, tally_access_token(config))
+        except TallyError as e:
+            print(f"  ✗ Tally: {e}")
     sync(load_data())
 
 
@@ -874,6 +949,7 @@ def cmd_status(_args):
     accounts.append(f"Tally: {config['tally']['email']}" if config.get("tally") else "Tally: not signed in")
     accounts.append(f"Jira: {config['jira']['site']}" if config.get("jira") else "Jira: not connected")
     print("  " + " · ".join(accounts))
+    warn_jira_token(config)
 
 
 def cmd_report(_args):

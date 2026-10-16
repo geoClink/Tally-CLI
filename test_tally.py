@@ -302,5 +302,33 @@ class GitActivityTest(unittest.TestCase):
         self.assertEqual(tally.my_commits(self.repo, self.base - timedelta(hours=1), datetime.now().astimezone()), [])
 
 
+class WeekAndExpiryTest(unittest.TestCase):
+    def test_week_follows_account_week_start(self):
+        from datetime import date
+        thursday = date(2026, 10, 15)
+        self.assertEqual(tally.week_bounds(thursday, 1), (date(2026, 10, 12), date(2026, 10, 18)))  # Monday
+        self.assertEqual(tally.week_bounds(thursday, 0), (date(2026, 10, 11), date(2026, 10, 17)))  # Sunday
+        self.assertEqual(tally.week_bounds(thursday, 3), (date(2026, 10, 14), date(2026, 10, 20)))  # Wednesday
+        self.assertEqual(tally.week_bounds(thursday, 4), (thursday, date(2026, 10, 21)))  # starts today
+
+    def test_expiry_date_input(self):
+        from datetime import date
+        today = date(2026, 10, 15)
+        self.assertIsNone(tally.parse_expiry("", today))
+        self.assertEqual(tally.parse_expiry(" 2026-12-30 ", today), "2026-12-30")
+        for bad in ("12/30/2026", "2026-10-01", "2028-01-01"):
+            with self.assertRaises(tally.TallyError):
+                tally.parse_expiry(bad, today)
+
+    def test_expiry_warning_only_in_the_last_week(self):
+        from datetime import date
+        config = {"jira": {"token_expires_on": "2026-12-30"}}
+        self.assertIsNone(tally.jira_token_warning(config, date(2026, 12, 22)))
+        self.assertIn("in 7 days", tally.jira_token_warning(config, date(2026, 12, 23)))
+        self.assertIn("tomorrow", tally.jira_token_warning(config, date(2026, 12, 29)))
+        self.assertIn("expired", tally.jira_token_warning(config, date(2027, 1, 2)))
+        self.assertIsNone(tally.jira_token_warning({"jira": {}}, date(2026, 12, 29)))
+
+
 if __name__ == "__main__":
     unittest.main()
